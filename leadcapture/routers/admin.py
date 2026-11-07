@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Any, Literal
+
+from fastapi import APIRouter, Depends, Query, Response
+from pydantic import TypeAdapter, ValidationError
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from leadcapture.config import Settings
+from leadcapture.db import utcnow
+from leadcapture.deps import get_app_settings, get_session, require_admin
+from leadcapture.errors import ApiError
+from leadcapture.models import DeliveryLog, Form, Lead, LeadStatus, OutboxEvent, OutboxStatus
+from leadcapture.notifiers.configs import NotifierConfig, mask_config, restore_masked
+from leadcapture.schemas import (
+    DeliveryLogOut,
+    FormCreate,
+    FormOut,
+    FormUpdate,
+    LeadOut,
+    LeadPage,
+    LeadStatusUpdate,
+    OutboxOut,
+)
+from leadcapture.services.leads import LeadFilters, leads_to_csv, query_leads
+
+router = APIRouter(
+    prefix="/v1/admin",
+    tags=["Admin"],
+    dependencies=[Depends(require_admin)],
+    responses={401: {"description": "Missing or invalid API key."}},
+)
+
+Session = Annotated[AsyncSession, Depends(get_session)]
+_notifier_adapter: TypeAdapter[Any] = TypeAdapter(list[NotifierConfig])
+
+
+def form_out(form: Form) -> FormOut:
+    out = FormOut.model_validate(form)
+    out.notifiers = [mask_config(n) for n in form.notifiers]
+    return out
+
+
+def lead_out(lead: Lead, form_slug: str) -> LeadOut:
+    return LeadOut(
+        id=lead.id,
+        form=form_slug,
+        data=lead.data,
+        name=lead.name,
+        email=lead.email,
+        consent=lead.consent,
+        consent_at=lead.consent_at,
+        status=LeadStatus(lead.status),
+        spam_score=lead.spam_score,
+        is_spam=lead.is_spam,
+        spam_reasons=lead.spam_reasons,
+        source_url=lead.source_url,
+        user_agent=lead.user_agent,
+        created_at=lead.created_at,
+        updated_at=lead.updated_at,
+    )
+
+
+async def _get_form(session: AsyncSession, slug: str) -> Form:
+    form = (await session.execute(select(Form).where(Form.slug == slug))).scalar_one_or_none()
+    if form is None:
+        raise ApiError(404, "form_not_found", f"Form {slug!r} does not exist.")
+    return form
+
+
+def lead_filters(
+    form: Annotated[str | None, Query(description="Form slug")] = None,
+    status: LeadStatus | None = None,
+    q: Annotated[str | None, Query(description="Search name, email and field values")] = None,
+    spam: Annotated[Literal["exclude", "include", "only"], Query()] = "exclude",
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+) -> LeadFilters:
+    return LeadFilters(
+        form=form,
+        status=status.value if status else None,
+        q=q,
+        spam=spam,
+        created_from=created_from,
+        created_to=created_to,
+    )
+
+
+Filters = Annotated[LeadFilters, Depends(lead_filters)]
+
+
+# ---------------------------------------------------------------- forms
+
+
+@router.post("/forms", response_model=FormOut, status_code=201, summary="Create a form")
+async def create_form(body: FormCreate, session: Session) -> FormOut:
+    form = Form(
+        slug=body.slug,
+        **body.model_dump(mode="json", exclude={"slug", "fields", "notifiers"}),
+        fields=[f.model_dump(mode="json") for f in body.fields],
+        notifiers=[n.model_dump(mode="json") for n in body.notifiers],
+    )
+    session.add(form)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise ApiError(
+            409, "slug_taken", f"A form with slug {body.slug!r} already exists."
+        ) from None
+    return form_out(form)
+
+
+@router.get("/forms", response_model=list[FormOut], summary="List forms")
+async def list_forms(session: Session) -> list[FormOut]:
+    forms = (await session.execute(select(Form).order_by(Form.created_at))).scalars().all()
+    return [form_out(f) for f in forms]
+
+
+@router.get("/forms/{slug}", response_model=FormOut, summary="Get a form")
+async def get_form(slug: str, session: Session) -> FormOut:
+    return form_out(await _get_form(session, slug))
+
+
+@router.patch("/forms/{slug}", response_model=FormOut, summary="Update a form")
+async def update_form(slug: str, body: FormUpdate, session: Session) -> FormOut:
+    form = await _get_form(session, slug)
+    changes = body.model_dump(exclude_unset=True, mode="json")
+
+    if "fields" in changes:
+        names = [f["name"] for f in changes["fields"]]
+        if len(names) != len(set(names)):
+            raise ApiError(422, "validation_failed", "field names must be unique")
+    if "notifiers" in changes:
+        try:
+            restored = restore_masked(changes["notifiers"], form.notifiers)
+            validated = _notifier_adapter.validate_python(restored)
+        except (ValueError, ValidationError) as exc:
+            raise ApiError(422, "invalid_notifiers", str(exc)) from None
+        changes["notifiers"] = [n.model_dump(mode="json") for n in validated]
+    if "allowed_origins" in changes:
+        try:
+            probe = FormCreate.model_validate(
+                {
+                    "slug": "probe-slug",
+                    "name": "x",
+                    "fields": [{"name": "a"}],
+                    "allowed_origins": changes["allowed_origins"],
+                }
+            )
+        except ValidationError as exc:
+            raise ApiError(422, "invalid_origins", exc.errors()[0]["msg"]) from None
+        changes["allowed_origins"] = probe.allowed_origins
+    redirect = changes.get("success_redirect_url")
+    if redirect and not str(redirect).startswith(("http://", "https://")):
+        raise ApiError(422, "validation_failed", "success_redirect_url must be http(s)")
+
+    for key, value in changes.items():
+        setattr(form, key, value)
+    await session.commit()
+    return form_out(form)
+
+
+@router.delete("/forms/{slug}", status_code=204, summary="Delete a form and all its leads")
+async def delete_form(slug: str, session: Session) -> Response:
+    form = await _get_form(session, slug)
+    await session.delete(form)
+    await session.commit()
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------- leads
+
+
+@router.get("/leads", response_model=LeadPage, summary="List and search leads")
+async def list_leads(
+    session: Session,
+    filters: Filters,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> LeadPage:
+    rows, total = await query_leads(session, filters, limit=limit, offset=offset)
+    return LeadPage(
+        items=[lead_out(lead, slug) for lead, slug in rows], total=total, limit=limit, offset=offset
+    )
+
+
+@router.get(
+    "/leads/export.csv",
+    summary="Export leads as CSV",
+    response_class=Response,
+    responses={200: {"content": {"text/csv": {}}, "description": "CSV file"}},
+)
+async def export_leads(
+    session: Session, filters: Filters, settings: Annotated[Settings, Depends(get_app_settings)]
+) -> Response:
+    rows, _ = await query_leads(session, filters, limit=settings.export_max_rows)
+    stamp = utcnow().strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=leads_to_csv(rows),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="leads-{stamp}.csv"'},
+    )
+
+
+async def _get_lead(session: AsyncSession, lead_id: str) -> tuple[Lead, str]:
+    row = (
+        await session.execute(
+            select(Lead, Form.slug).join(Form, Form.id == Lead.form_id).where(Lead.id == lead_id)
+        )
+    ).first()
+    if row is None:
+        raise ApiError(404, "lead_not_found", "Lead not found.")
+    return row[0], row[1]
+
+
+@router.get("/leads/{lead_id}", response_model=LeadOut, summary="Get a lead")
+async def get_lead(lead_id: str, session: Session) -> LeadOut:
+    lead, slug = await _get_lead(session, lead_id)
+    return lead_out(lead, slug)
+
+
+@router.patch("/leads/{lead_id}", response_model=LeadOut, summary="Set a lead's status")
+async def update_lead_status(lead_id: str, body: LeadStatusUpdate, session: Session) -> LeadOut:
+    lead, slug = await _get_lead(session, lead_id)
+    lead.status = body.status.value
+    await session.commit()
+    return lead_out(lead, slug)
+
+
+@router.delete("/leads/{lead_id}", status_code=204, summary="Erase a lead (GDPR erasure)")
+async def delete_lead(lead_id: str, session: Session) -> Response:
+    lead, _ = await _get_lead(session, lead_id)
+    await session.delete(lead)
+    await session.commit()
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------- deliveries
+
+
+@router.get("/deliveries", response_model=list[DeliveryLogOut], summary="Delivery attempt logs")
+async def list_deliveries(
+    session: Session,
+    lead_id: str | None = None,
+    success: bool | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[DeliveryLogOut]:
+    stmt = select(DeliveryLog).order_by(DeliveryLog.created_at.desc(), DeliveryLog.attempt.desc())
+    if lead_id:
+        stmt = stmt.where(DeliveryLog.lead_id == lead_id)
+    if success is not None:
+        stmt = stmt.where(DeliveryLog.success.is_(success))
+    rows = (await session.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return [DeliveryLogOut.model_validate(r) for r in rows]
+
+
+@router.get("/outbox", response_model=list[OutboxOut], summary="Outbox events and their state")
+async def list_outbox(
+    session: Session,
+    status: OutboxStatus | None = None,
+    lead_id: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[OutboxOut]:
+    stmt = select(OutboxEvent).order_by(OutboxEvent.created_at.desc())
+    if status:
+        stmt = stmt.where(OutboxEvent.status == status.value)
+    if lead_id:
+        stmt = stmt.where(OutboxEvent.lead_id == lead_id)
+    rows = (await session.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return [OutboxOut.model_validate(r) for r in rows]
+
+
+@router.post(
+    "/outbox/{event_id}/retry", response_model=OutboxOut, summary="Requeue a failed delivery"
+)
+async def retry_outbox_event(event_id: str, session: Session) -> OutboxOut:
+    event = await session.get(OutboxEvent, event_id)
+    if event is None:
+        raise ApiError(404, "outbox_not_found", "Outbox event not found.")
+    if event.status == OutboxStatus.delivered.value:
+        raise ApiError(409, "already_delivered", "This delivery already succeeded.")
+    event.status = OutboxStatus.pending.value
+    event.attempts = 0
+    event.next_attempt_at = utcnow()
+    event.locked_at = None
+    await session.commit()
+    return OutboxOut.model_validate(event)
+
+
+@router.get("/stats", summary="Lead counts per status")
+async def stats(session: Session) -> dict[str, Any]:
+    rows = (
+        await session.execute(
+            select(Lead.status, func.count(Lead.id))
+            .where(Lead.is_spam.is_(False))
+            .group_by(Lead.status)
+        )
+    ).all()
+    counts = {s.value: 0 for s in LeadStatus}
+    counts.update({status: int(n) for status, n in rows})
+    spam = (
+        await session.execute(select(func.count(Lead.id)).where(Lead.is_spam.is_(True)))
+    ).scalar_one()
+    return {"by_status": counts, "spam": int(spam)}
