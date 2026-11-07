@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `examples/`: a working static HTML landing-page form (shows the `_form_token` flow), a Next.js route
+  handler proxy and an n8n webhook signature verification Code node. A test keeps the example form's
+  field names in line with the default example schema.
+
 ## [1.0.0] - 2026-01-05
 
 ### Added

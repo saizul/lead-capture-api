@@ -239,6 +239,9 @@ Remember to add your site's origin to the form's `allowed_origins`. A plain (no 
 `<form method="post" action=".../submit">` also works: the browser sends URL-encoded data and, if the
 form has a `success_redirect_url`, receives a `303` redirect to your thank-you page.
 
+More complete, copy-paste examples live in [`examples/`](examples/README.md): a static HTML landing
+page, a Next.js route handler that proxies submissions, and an n8n signature-check Code node.
+
 ## Webhook payload and signature verification
 
 Every webhook delivery is a JSON `POST` with these headers:
