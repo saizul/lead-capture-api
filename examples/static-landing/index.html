@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Get a quote</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; color: #1f2933; }
+    label { display: block; margin-top: 1rem; font-weight: 600; }
+    input, select, textarea { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; }
+    .check { font-weight: 400; }
+    .check input { width: auto; }
+    .error { color: #b42318; font-size: .875rem; margin: .25rem 0 0; min-height: 1em; }
+    button { margin-top: 1.25rem; padding: .6rem 1.2rem; font: inherit; cursor: pointer; }
+    button[disabled] { opacity: .6; cursor: progress; }
+    #status { margin-top: 1rem; }
+    /* Honeypot: hidden from people and screen readers, tempting to bots. */
+    .hp { position: absolute; left: -9999px; }
+  </style>
+</head>
+<body>
+  <h1>Get a quote</h1>
+
+  <!--
+    Field names match the "contact" form from the README (name, email, phone, budget, message).
+    The form slug and API address are read from the data attributes below.
+  -->
+  <form id="lead-form" novalidate data-api="http://127.0.0.1:8000" data-slug="contact">
+    <label for="name">Your name</label>
+    <input id="name" name="name" autocomplete="name" required maxlength="120">
+    <p class="error" data-error-for="name"></p>
+
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="email" required>
+    <p class="error" data-error-for="email"></p>
+
+    <label for="phone">Phone (optional)</label>
+    <input id="phone" name="phone" type="tel" autocomplete="tel">
+    <p class="error" data-error-for="phone"></p>
+
+    <label for="budget">Budget</label>
+    <select id="budget" name="budget">
+      <option value="">Choose one</option>
+      <option value="under-1k">Under $1k</option>
+      <option value="1k-5k">$1k to $5k</option>
+      <option value="5k-plus">$5k or more</option>
+    </select>
+    <p class="error" data-error-for="budget"></p>
+
+    <label for="message">How can we help?</label>
+    <textarea id="message" name="message" rows="5" required maxlength="2000"></textarea>
+    <p class="error" data-error-for="message"></p>
+
+    <!-- honeypot (the form's honeypot_field, "website_url" by default) -->
+    <div class="hp" aria-hidden="true">
+      <label>Leave this empty <input name="website_url" tabindex="-1" autocomplete="off"></label>
+    </div>
+
+    <label class="check">
+      <input type="checkbox" name="consent"> I agree to be contacted about my enquiry.
+    </label>
+    <p class="error" data-error-for="consent"></p>
+
+    <!-- filled from GET /v1/forms/{slug}/schema; proves when the form was shown -->
+    <input type="hidden" name="_form_token">
+
+    <button type="submit" id="submit" disabled>Send</button>
+    <p id="status" role="status" aria-live="polite"></p>
+  </form>
+
+  <script>
+    const form = document.getElementById("lead-form");
+    const button = document.getElementById("submit");
+    const status = document.getElementById("status");
+    const API = form.dataset.api;
+    const SLUG = form.dataset.slug;
+    const SCHEMA_URL = `${API}/v1/forms/${SLUG}/schema`;
+    const SUBMIT_URL = `${API}/v1/forms/${SLUG}/submit`;
+
+    // 1. When the page renders, fetch the signed form token. The API rejects submissions that
+    //    arrive sooner than the form's min_submit_seconds after this moment.
+    async function loadToken() {
+      button.disabled = true;
+      try {
+        const res = await fetch(SCHEMA_URL);
+        if (!res.ok) throw new Error(`schema request failed (${res.status})`);
+        const schema = await res.json();
+        form.elements._form_token.value = schema.form_token;
+        button.disabled = false;
+      } catch (err) {
+        status.textContent = "The form is unavailable right now. Please try again later.";
+        console.error(err);
+      }
+    }
+
+    function showErrors(fields) {
+      for (const el of form.querySelectorAll("[data-error-for]")) {
+        el.textContent = fields[el.dataset.errorFor] || "";
+      }
+    }
+
+    // 2. On submit, POST the values as JSON, including _form_token and the honeypot.
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      showErrors({});
+      status.textContent = "";
+      button.disabled = true;
+
+      const body = Object.fromEntries(new FormData(form));
+      body.consent = form.elements.consent.checked;
+      body._source_url = location.href;
+
+      try {
+        const res = await fetch(SUBMIT_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (res.ok) {
+          form.reset();
+          status.textContent = "Thanks, we will be in touch.";
+          await loadToken(); // a fresh token for any further submission
+          return;
+        }
+        const { error } = await res.json();
+        if (error.code === "validation_failed") {
+          showErrors(error.fields || {});
+        } else if (res.status === 429) {
+          status.textContent = "Too many attempts. Please wait a bit and try again.";
+        } else {
+          status.textContent = error.message || "Something went wrong.";
+          if (error.code && error.code.startsWith("form_token")) await loadToken();
+        }
+      } catch (err) {
+        status.textContent = "Network error. Please try again.";
+        console.error(err);
+      } finally {
+        if (form.elements._form_token.value) button.disabled = false;
+      }
+    });
+
+    loadToken();
+  </script>
+</body>
+</html>
