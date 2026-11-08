@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Response
@@ -308,3 +308,52 @@ async def stats(session: Session) -> dict[str, Any]:
         await session.execute(select(func.count(Lead.id)).where(Lead.is_spam.is_(True)))
     ).scalar_one()
     return {"by_status": counts, "spam": int(spam)}
+
+
+@router.get("/stats/daily", summary="Daily lead counts per form")
+async def daily_stats(
+    session: Session,
+    days: Annotated[int, Query(ge=1, le=366, description="Window length, ending today (UTC)")] = 30,
+    form: Annotated[str | None, Query(description="Only this form slug")] = None,
+    spam: Annotated[Literal["exclude", "include", "only"], Query()] = "exclude",
+) -> dict[str, Any]:
+    """Zero-filled daily series, ready for charts.
+
+    ``dates`` lists every UTC day in the window; ``forms[slug]`` and ``total`` hold the
+    lead count for the day at the same index.
+    """
+    if form is not None:
+        await _get_form(session, form)
+    end_day = utcnow().date()
+    start_day = end_day - timedelta(days=days - 1)
+    start = datetime.combine(start_day, time.min, tzinfo=timezone.utc)
+    day = func.date(Lead.created_at)
+    query = (
+        select(Form.slug, day, func.count(Lead.id))
+        .join(Form, Form.id == Lead.form_id)
+        .where(Lead.created_at >= start)
+        .group_by(Form.slug, day)
+    )
+    if form is not None:
+        query = query.where(Form.slug == form)
+    if spam == "exclude":
+        query = query.where(Lead.is_spam.is_(False))
+    elif spam == "only":
+        query = query.where(Lead.is_spam.is_(True))
+    dates = [(start_day + timedelta(days=i)).isoformat() for i in range(days)]
+    index = {d: i for i, d in enumerate(dates)}
+    forms: dict[str, list[int]] = {}
+    total = [0] * days
+    for slug, bucket, count in (await session.execute(query)).all():
+        i = index.get(str(bucket))
+        if i is None:  # a lead dated in the future falls outside the window
+            continue
+        forms.setdefault(slug, [0] * days)[i] += int(count)
+        total[i] += int(count)
+    return {
+        "days": days,
+        "spam": spam,
+        "dates": dates,
+        "forms": dict(sorted(forms.items())),
+        "total": total,
+    }
