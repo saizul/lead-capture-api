@@ -77,6 +77,7 @@ async def test_last_used_is_tracked(app, client, admin):
         "/v1/admin/deliveries",
         "/v1/admin/outbox",
         "/v1/admin/stats",
+        "/v1/admin/stats/daily",
     ],
 )
 async def test_every_admin_route_is_protected(client, path):
@@ -359,6 +360,50 @@ async def test_stats(app, client, admin):
     await seed(app)
     stats = (await client.get("/v1/admin/stats", headers=admin)).json()
     assert stats == {"by_status": {"new": 1, "contacted": 1, "won": 1, "lost": 0}, "spam": 1}
+
+
+async def test_daily_stats_is_zero_filled_and_per_form(app, client, admin):
+    await seed(app)
+    data = (await client.get("/v1/admin/stats/daily", params={"days": 5}, headers=admin)).json()
+    today = utcnow().date()
+    assert data["days"] == 5 and data["spam"] == "exclude"
+    assert data["dates"] == [(today - timedelta(days=n)).isoformat() for n in (4, 3, 2, 1, 0)]
+    # seed(): 2 leads on the first form (3 and 2 days ago), 1 on "other" (yesterday); spam excluded
+    assert data["total"] == [0, 1, 1, 1, 0]
+    assert sorted(data["forms"]) == ["contact", "other"]
+    assert sum(sum(counts) for counts in data["forms"].values()) == 3
+    assert all(len(counts) == 5 for counts in data["forms"].values())
+
+
+async def test_daily_stats_window_and_spam_filter(app, client, admin):
+    await seed(app)
+    narrow = (await client.get("/v1/admin/stats/daily", params={"days": 1}, headers=admin)).json()
+    assert narrow["total"] == [0]
+    spam = (
+        await client.get("/v1/admin/stats/daily", params={"spam": "only"}, headers=admin)
+    ).json()
+    assert spam["days"] == 30 and sum(spam["total"]) == 1
+    everything = (
+        await client.get("/v1/admin/stats/daily", params={"spam": "include"}, headers=admin)
+    ).json()
+    assert sum(everything["total"]) == 4
+
+
+async def test_daily_stats_form_filter(app, client, admin):
+    await seed(app)
+    resp = await client.get(
+        "/v1/admin/stats/daily", params={"form": "other", "days": 3}, headers=admin
+    )
+    data = resp.json()
+    assert list(data["forms"]) == ["other"] and data["total"] == [0, 1, 0]
+    missing = await client.get("/v1/admin/stats/daily", params={"form": "nope"}, headers=admin)
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "form_not_found"
+
+
+@pytest.mark.parametrize("days", [0, 367])
+async def test_daily_stats_rejects_bad_window(client, admin, days):
+    resp = await client.get("/v1/admin/stats/daily", params={"days": days}, headers=admin)
+    assert resp.status_code in (400, 422)
 
 
 # ------------------------------------------------------------ CSV

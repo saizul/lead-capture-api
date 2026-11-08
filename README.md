@@ -184,6 +184,15 @@ curl -X DELETE -H "X-API-Key: $LC_KEY" http://localhost:8000/v1/admin/leads/<lea
 
 Spam is hidden from lead lists by default; use `spam=include` or `spam=only`.
 
+Lead volume over time (zero-filled UTC days, one count array per form, handy for charts):
+
+```bash
+curl -H "X-API-Key: $LC_KEY" "http://localhost:8000/v1/admin/stats/daily?days=14&form=contact"
+# {"days":14,"spam":"exclude","dates":["2026-01-01",...],"forms":{"contact":[0,2,...]},"total":[0,2,...]}
+```
+
+`days` is 1-366 (default 30); `form` limits the series to one slug (404 if unknown); `spam` works as for lead lists.
+
 ### HTML form snippet
 
 The form fetches a signed token when it renders (this powers the minimum time-to-submit check) and
