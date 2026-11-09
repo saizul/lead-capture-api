@@ -377,3 +377,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 MIT, see [LICENSE](LICENSE). Created by [Saizul Amin](https://saizul.com).
+
+## Container image
+
+A multi-arch image (amd64, arm64) is published to GitHub Container Registry on every change to `main`:
+
+```bash
+docker pull ghcr.io/saizul/lead-capture-api:latest
+docker run -p 8000:8000 -v leads:/data ghcr.io/saizul/lead-capture-api:latest
+```
