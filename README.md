@@ -193,6 +193,15 @@ curl -H "X-API-Key: $LC_KEY" "http://localhost:8000/v1/admin/stats/daily?days=14
 
 `days` is 1-366 (default 30); `form` limits the series to one slug (404 if unknown); `spam` works as for lead lists.
 
+Spam rate per form and day (useful for tuning a form's spam threshold or spotting an attack):
+
+```bash
+curl -H "X-API-Key: $LC_KEY" "http://localhost:8000/v1/admin/stats/spam-rate?days=14&form=contact"
+# {"days":14,"dates":[...],"forms":{"contact":{"total":[0,4,...],"spam":[0,1,...],"rate":[null,0.25,...],"overall_rate":0.25}},"overall":{...}}
+```
+
+`rate` is `spam / total` for the day (0-1) and `null` on days without submissions, so charts can show a gap instead of 0%. `overall` aggregates every form in the window; `days` and `form` work as above.
+
 ### HTML form snippet
 
 The form fetches a signed token when it renders (this powers the minimum time-to-submit check) and

@@ -26,6 +26,7 @@ from leadcapture.schemas import (
     OutboxOut,
 )
 from leadcapture.services.leads import LeadFilters, leads_to_csv, query_leads
+from leadcapture.services.stats import spam_rate_series
 
 router = APIRouter(
     prefix="/v1/admin",
@@ -357,3 +358,36 @@ async def daily_stats(
         "forms": dict(sorted(forms.items())),
         "total": total,
     }
+
+
+@router.get("/stats/spam-rate", summary="Daily spam rate per form")
+async def spam_rate_stats(
+    session: Session,
+    days: Annotated[int, Query(ge=1, le=366, description="Window length, ending today (UTC)")] = 30,
+    form: Annotated[str | None, Query(description="Only this form slug")] = None,
+) -> dict[str, Any]:
+    """Share of submissions flagged as spam, per UTC day and form.
+
+    Every series is aligned with ``dates``. ``rate`` is ``spam / total`` (0-1) and ``null`` on
+    days without submissions. ``overall`` aggregates all forms in the window.
+    """
+    if form is not None:
+        await _get_form(session, form)
+    end_day = utcnow().date()
+    start_day = end_day - timedelta(days=days - 1)
+    start = datetime.combine(start_day, time.min, tzinfo=timezone.utc)
+    day = func.date(Lead.created_at)
+    query = (
+        select(Form.slug, day, Lead.is_spam, func.count(Lead.id))
+        .join(Form, Form.id == Lead.form_id)
+        .where(Lead.created_at >= start)
+        .group_by(Form.slug, day, Lead.is_spam)
+    )
+    if form is not None:
+        query = query.where(Form.slug == form)
+    dates = [(start_day + timedelta(days=i)).isoformat() for i in range(days)]
+    rows = [
+        (slug, str(bucket), bool(is_spam), int(count))
+        for slug, bucket, is_spam, count in (await session.execute(query)).all()
+    ]
+    return {"days": days, "dates": dates, **spam_rate_series(rows, dates)}
