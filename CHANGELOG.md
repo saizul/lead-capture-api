@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `GET /v1/admin/stats/spam-rate`: daily spam counts and spam rate per form plus an overall series (`days`, `form` parameters; `null` rate on days without submissions).
 - `GET /v1/admin/stats/daily`: zero-filled daily lead counts per form (`days`, `form`, `spam` parameters).
 - `examples/`: a working static HTML landing-page form (shows the `_form_token` flow), a Next.js route
   handler proxy and an n8n webhook signature verification Code node. A test keeps the example form's
