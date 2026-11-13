@@ -7,11 +7,21 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Lead tags and an internal note: `PATCH /v1/admin/leads/{id}` now accepts `tags`, `add_tags`,
+  `remove_tags` and `note` alongside `status`; repeatable `tag` filter on lead lists and the CSV
+  export; `GET /v1/admin/tags` with per-tag lead counts; `POST /v1/admin/leads/bulk-update` to set a
+  status or add/remove tags on up to 500 leads at once (all-or-nothing). Migration `0002` adds the
+  `leads.tags` and `leads.note` columns (run `leadcapture migrate`).
+- CI and package metadata now cover Python 3.13.
 - `GET /v1/admin/stats/spam-rate`: daily spam counts and spam rate per form plus an overall series (`days`, `form` parameters; `null` rate on days without submissions).
 - `GET /v1/admin/stats/daily`: zero-filled daily lead counts per form (`days`, `form`, `spam` parameters).
 - `examples/`: a working static HTML landing-page form (shows the `_form_token` flow), a Next.js route
   handler proxy and an n8n webhook signature verification Code node. A test keeps the example form's
   field names in line with the default example schema.
+
+### Changed
+- Lead responses include `tags` and `note`. The CSV export has two new columns: `tags` (after
+  `status`) and `note` (after `source_url`); scripts that read columns by position need updating.
 
 ## [1.0.0] - 2026-01-05
 

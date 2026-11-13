@@ -79,6 +79,7 @@ async def test_last_used_is_tracked(app, client, admin):
         "/v1/admin/stats",
         "/v1/admin/stats/daily",
         "/v1/admin/stats/spam-rate",
+        "/v1/admin/tags",
     ],
 )
 async def test_every_admin_route_is_protected(client, path):

@@ -11,6 +11,10 @@ from leadcapture.models import LeadStatus
 from leadcapture.notifiers.configs import NotifierConfig
 
 ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.\-]+(?::\d{1,5})?$")
+TAG_RE = re.compile(r"^[a-z0-9][a-z0-9_.:\-]{0,31}$")
+MAX_TAGS_PER_LEAD = 20
+MAX_NOTE_LENGTH = 5000
+MAX_BULK_IDS = 500
 SLUG_PATTERN = r"^[a-z0-9][a-z0-9\-_]{1,62}$"
 
 CONTACT_FORM_EXAMPLE: dict[str, Any] = {
@@ -156,6 +160,22 @@ class SubmitResponse(BaseModel):
     )
 
 
+def normalize_tag(value: str) -> str:
+    """Trim and lower-case a tag, rejecting anything outside ``TAG_RE``."""
+    tag = value.strip().lower()
+    if not TAG_RE.match(tag):
+        raise ValueError(
+            f"invalid tag {value!r}: use 1-32 characters from a-z, 0-9, '-', '_', '.', ':'"
+            " starting with a letter or digit"
+        )
+    return tag
+
+
+def normalize_tags(values: list[str]) -> list[str]:
+    """Normalise a list of tags, dropping duplicates while keeping the first occurrence."""
+    return list(dict.fromkeys(normalize_tag(v) for v in values))
+
+
 class LeadOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -167,6 +187,8 @@ class LeadOut(BaseModel):
     consent: bool
     consent_at: datetime | None
     status: LeadStatus
+    tags: list[str]
+    note: str | None
     spam_score: int
     is_spam: bool
     spam_reasons: list[str]
@@ -183,10 +205,109 @@ class LeadPage(BaseModel):
     offset: int
 
 
-class LeadStatusUpdate(BaseModel):
-    status: LeadStatus
+class _TagChanges(BaseModel):
+    add_tags: list[str] = Field(default_factory=list, max_length=MAX_TAGS_PER_LEAD)
+    remove_tags: list[str] = Field(default_factory=list, max_length=MAX_TAGS_PER_LEAD)
 
-    model_config = ConfigDict(json_schema_extra={"examples": [{"status": "contacted"}]})
+    @field_validator("add_tags", "remove_tags")
+    @classmethod
+    def _normalize(cls, value: list[str]) -> list[str]:
+        return normalize_tags(value)
+
+    @model_validator(mode="after")
+    def _no_overlap(self) -> _TagChanges:
+        both = set(self.add_tags) & set(self.remove_tags)
+        if both:
+            raise ValueError(f"tags both added and removed: {', '.join(sorted(both))}")
+        return self
+
+
+class LeadUpdate(_TagChanges):
+    """Partial update of a lead's triage fields. Omitted fields are left unchanged."""
+
+    status: LeadStatus | None = None
+    tags: list[str] | None = Field(
+        default=None,
+        max_length=MAX_TAGS_PER_LEAD,
+        description="Replace all tags. Cannot be combined with add_tags / remove_tags.",
+    )
+    note: str | None = Field(
+        default=None,
+        max_length=MAX_NOTE_LENGTH,
+        description="Internal note. Send null or an empty string to clear it.",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {"status": "contacted"},
+                {"add_tags": ["vip"], "note": "Called on Monday, follow up next week."},
+                {"tags": ["agency", "q4"]},
+            ]
+        }
+    )
+
+    @field_validator("tags")
+    @classmethod
+    def _normalize_replacement(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else normalize_tags(value)
+
+    @model_validator(mode="after")
+    def _check(self) -> LeadUpdate:
+        fields = self.model_fields_set
+        if not fields:
+            raise ValueError("provide at least one of status, tags, add_tags, remove_tags, note")
+        if "status" in fields and self.status is None:
+            raise ValueError("status cannot be null")
+        if "tags" in fields and (self.add_tags or self.remove_tags):
+            raise ValueError("use either tags or add_tags / remove_tags, not both")
+        if "tags" in fields and self.tags is None:
+            raise ValueError("tags cannot be null; send [] to clear them")
+        return self
+
+
+# Backwards-compatible name for the original status-only body.
+LeadStatusUpdate = LeadUpdate
+
+
+class LeadBulkUpdate(_TagChanges):
+    """Apply the same status and/or tag change to many leads at once."""
+
+    ids: list[str] = Field(min_length=1, max_length=MAX_BULK_IDS)
+    status: LeadStatus | None = None
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "ids": ["0b7c0d6e-5d1f-4c37-9a8e-1f2d3c4b5a69"],
+                    "status": "contacted",
+                    "add_tags": ["campaign:spring"],
+                }
+            ]
+        }
+    )
+
+    @field_validator("ids")
+    @classmethod
+    def _dedupe_ids(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _check(self) -> LeadBulkUpdate:
+        if self.status is None and not self.add_tags and not self.remove_tags:
+            raise ValueError("provide status, add_tags or remove_tags")
+        return self
+
+
+class LeadBulkResult(BaseModel):
+    updated: int
+    not_found: list[str]
+
+
+class TagCount(BaseModel):
+    tag: str
+    count: int
 
 
 class OutboxOut(BaseModel):
