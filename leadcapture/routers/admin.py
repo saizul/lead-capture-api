@@ -16,16 +16,27 @@ from leadcapture.errors import ApiError
 from leadcapture.models import DeliveryLog, Form, Lead, LeadStatus, OutboxEvent, OutboxStatus
 from leadcapture.notifiers.configs import NotifierConfig, mask_config, restore_masked
 from leadcapture.schemas import (
+    MAX_TAGS_PER_LEAD,
     DeliveryLogOut,
     FormCreate,
     FormOut,
     FormUpdate,
+    LeadBulkResult,
+    LeadBulkUpdate,
     LeadOut,
     LeadPage,
-    LeadStatusUpdate,
+    LeadUpdate,
     OutboxOut,
+    TagCount,
+    normalize_tag,
 )
-from leadcapture.services.leads import LeadFilters, leads_to_csv, query_leads
+from leadcapture.services.leads import (
+    LeadFilters,
+    leads_to_csv,
+    merge_tags,
+    query_leads,
+    tag_counts,
+)
 from leadcapture.services.stats import spam_rate_series
 
 router = APIRouter(
@@ -55,6 +66,8 @@ def lead_out(lead: Lead, form_slug: str) -> LeadOut:
         consent=lead.consent,
         consent_at=lead.consent_at,
         status=LeadStatus(lead.status),
+        tags=list(lead.tags or []),
+        note=lead.note,
         spam_score=lead.spam_score,
         is_spam=lead.is_spam,
         spam_reasons=lead.spam_reasons,
@@ -79,7 +92,15 @@ def lead_filters(
     spam: Annotated[Literal["exclude", "include", "only"], Query()] = "exclude",
     created_from: datetime | None = None,
     created_to: datetime | None = None,
+    tag: Annotated[
+        list[str] | None,
+        Query(description="Only leads carrying this tag; repeat to require several tags"),
+    ] = None,
 ) -> LeadFilters:
+    try:
+        tags = tuple(dict.fromkeys(normalize_tag(t) for t in tag or []))
+    except ValueError as exc:
+        raise ApiError(422, "validation_failed", str(exc)) from None
     return LeadFilters(
         form=form,
         status=status.value if status else None,
@@ -87,6 +108,7 @@ def lead_filters(
         spam=spam,
         created_from=created_from,
         created_to=created_to,
+        tags=tags,
     )
 
 
@@ -224,12 +246,65 @@ async def get_lead(lead_id: str, session: Session) -> LeadOut:
     return lead_out(lead, slug)
 
 
-@router.patch("/leads/{lead_id}", response_model=LeadOut, summary="Set a lead's status")
-async def update_lead_status(lead_id: str, body: LeadStatusUpdate, session: Session) -> LeadOut:
+def _apply_tags(
+    lead: Lead,
+    *,
+    replace: list[str] | None = None,
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+) -> None:
+    tags = merge_tags(lead.tags or [], replace=replace, add=add or (), remove=remove or ())
+    if len(tags) > MAX_TAGS_PER_LEAD:
+        raise ApiError(
+            422,
+            "too_many_tags",
+            f"A lead can carry at most {MAX_TAGS_PER_LEAD} tags (lead {lead.id}).",
+        )
+    if tags != list(lead.tags or []):
+        lead.tags = tags
+
+
+@router.patch(
+    "/leads/{lead_id}",
+    response_model=LeadOut,
+    summary="Update a lead's status, tags or note",
+)
+async def update_lead(lead_id: str, body: LeadUpdate, session: Session) -> LeadOut:
+    """Partial update. ``tags`` replaces the whole list; ``add_tags`` / ``remove_tags`` edit it.
+
+    Tags are lower-cased and de-duplicated. A ``note`` of ``null`` or ``""`` clears the note.
+    """
     lead, slug = await _get_lead(session, lead_id)
-    lead.status = body.status.value
+    fields = body.model_fields_set
+    if body.status is not None:
+        lead.status = body.status.value
+    if "tags" in fields or body.add_tags or body.remove_tags:
+        _apply_tags(lead, replace=body.tags, add=body.add_tags, remove=body.remove_tags)
+    if "note" in fields:
+        lead.note = (body.note or "").strip() or None
     await session.commit()
     return lead_out(lead, slug)
+
+
+@router.post(
+    "/leads/bulk-update",
+    response_model=LeadBulkResult,
+    summary="Set status and/or add or remove tags on many leads",
+)
+async def bulk_update_leads(body: LeadBulkUpdate, session: Session) -> LeadBulkResult:
+    """All-or-nothing: if any lead would exceed the tag limit, nothing is changed.
+
+    Unknown IDs are reported in ``not_found`` and do not fail the request.
+    """
+    leads = (await session.execute(select(Lead).where(Lead.id.in_(body.ids)))).scalars().all()
+    found = {lead.id for lead in leads}
+    for lead in leads:
+        if body.status is not None:
+            lead.status = body.status.value
+        if body.add_tags or body.remove_tags:
+            _apply_tags(lead, add=body.add_tags, remove=body.remove_tags)
+    await session.commit()
+    return LeadBulkResult(updated=len(found), not_found=[i for i in body.ids if i not in found])
 
 
 @router.delete("/leads/{lead_id}", status_code=204, summary="Erase a lead (GDPR erasure)")
@@ -238,6 +313,12 @@ async def delete_lead(lead_id: str, session: Session) -> Response:
     await session.delete(lead)
     await session.commit()
     return Response(status_code=204)
+
+
+@router.get("/tags", response_model=list[TagCount], summary="Tags in use, with lead counts")
+async def list_tags(session: Session, filters: Filters) -> list[TagCount]:
+    """Every tag carried by the leads matching the usual lead filters, most used first."""
+    return [TagCount(tag=t, count=n) for t, n in await tag_counts(session, filters)]
 
 
 # ---------------------------------------------------------------- deliveries

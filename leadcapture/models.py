@@ -79,6 +79,8 @@ class Lead(Base):
     is_spam: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     spam_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(16), default=LeadStatus.new.value, index=True)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
 

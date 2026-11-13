@@ -8,7 +8,7 @@ Built with FastAPI, SQLAlchemy 2 (async), Alembic, Pydantic v2 and httpx. Runs o
 and PostgreSQL in production.
 
 [![CI](https://github.com/saizulamin/lead-capture-api/actions/workflows/ci.yml/badge.svg)](https://github.com/saizulamin/lead-capture-api/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)
+![Python](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Features
@@ -25,7 +25,8 @@ and PostgreSQL in production.
   full delivery logs and manual retry. Notifiers: HMAC-signed webhook (n8n, Zapier, Make), SMTP email,
   Telegram bot, Slack incoming webhook.
 - **Admin API** (hashed API keys): form CRUD, lead search and filters, status tracking
-  (`new` / `contacted` / `won` / `lost`), CSV export, delivery logs.
+  (`new` / `contacted` / `won` / `lost`), tags and internal notes with bulk updates, CSV export,
+  delivery logs.
 - **Operations**: structured JSON logs with request IDs, `/healthz` and `/readyz`, OpenAPI docs with
   examples, Dockerfile, docker-compose (API + PostgreSQL + Redis), Makefile, CI.
 
@@ -183,6 +184,37 @@ curl -X DELETE -H "X-API-Key: $LC_KEY" http://localhost:8000/v1/admin/leads/<lea
 ```
 
 Spam is hidden from lead lists by default; use `spam=include` or `spam=only`.
+
+### Tags and notes
+
+Leads carry free-form tags (for pipelines, campaigns or owners) and one internal note. `PATCH`
+accepts any mix of `status`, `tags` (replace the list), `add_tags` / `remove_tags`, and `note`;
+omitted fields are left as they are.
+
+```bash
+curl -X PATCH -H "X-API-Key: $LC_KEY" -H "Content-Type: application/json" \
+  -d '{"status":"contacted","add_tags":["vip","campaign:spring"],"note":"Called, quote on Friday."}' \
+  http://localhost:8000/v1/admin/leads/<lead-id>
+
+# same status / tag change for up to 500 leads in one request (all-or-nothing)
+curl -X POST -H "X-API-Key: $LC_KEY" -H "Content-Type: application/json" \
+  -d '{"ids":["<id-1>","<id-2>"],"add_tags":["campaign:spring"],"remove_tags":["cold"]}' \
+  http://localhost:8000/v1/admin/leads/bulk-update
+# {"updated":2,"not_found":[]}
+
+curl -H "X-API-Key: $LC_KEY" "http://localhost:8000/v1/admin/leads?tag=vip&tag=campaign:spring"
+curl -H "X-API-Key: $LC_KEY" "http://localhost:8000/v1/admin/tags?form=contact"
+# [{"tag":"vip","count":12},{"tag":"campaign:spring","count":4}]
+```
+
+- Tags are lower-cased and de-duplicated; 1-32 characters from `a-z 0-9 - _ . :`, starting with a
+  letter or digit; at most 20 per lead (`422 too_many_tags` otherwise).
+- `tag` filters are exact and repeatable (a lead must carry every tag given). They work on the lead
+  list, the CSV export and `GET /v1/admin/tags`, together with the other lead filters.
+- `note` is capped at 5000 characters; send `null` or `""` to clear it. Notes are admin-only and are
+  never sent to notifiers.
+- The CSV export gains a `tags` column (`;`-separated) after `status` and a `note` column after
+  `source_url`.
 
 Lead volume over time (zero-filled UTC days, one count array per form, handy for charts):
 
@@ -376,7 +408,7 @@ leadcapture/
   notifiers/         webhook.py, email.py, telegram.py, slack.py, configs.py
   fields.py          field definitions and validation
   models.py db.py    SQLAlchemy models, engine helpers
-  migrations/        Alembic environment and versions
+  migrations/        Alembic environment and versions (run `leadcapture migrate` after upgrading)
   cli.py             Typer CLI
 tests/
 ```
